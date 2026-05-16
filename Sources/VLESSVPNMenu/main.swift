@@ -238,7 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startMenuItem.isEnabled = false
             stopMenuItem.isEnabled = true
             startMenuItem.state = .off
-            stopMenuItem.state = .on
+            stopMenuItem.state = .off
         case "off":
             setStatusIcon(symbolName: "shield.slash", toolTip: "VLESS VPN: выключен")
             statusMenuItem.title = "Статус: выключен (\(service), \(proxySummary))"

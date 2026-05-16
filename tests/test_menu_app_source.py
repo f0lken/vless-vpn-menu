@@ -29,6 +29,12 @@ class MenuAppSourceTests(unittest.TestCase):
         self.assertIn('runCommand("list-exclusions"', source)
         self.assertIn("promptForValue", source)
 
+    def test_action_menu_items_do_not_show_checkmarks(self):
+        source = SOURCE.read_text()
+
+        self.assertNotIn("startMenuItem.state = .on", source)
+        self.assertNotIn("stopMenuItem.state = .on", source)
+
 
 if __name__ == "__main__":
     unittest.main()
