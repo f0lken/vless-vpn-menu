@@ -1,0 +1,111 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true,
+    "output": "/opt/homebrew/var/log/sing-box/sing-box.log"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "cloudflare",
+        "type": "https",
+        "server": "1.1.1.1",
+        "detour": "proxy"
+      }
+    ],
+    "final": "cloudflare",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    },
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "YOUR_SERVER_IP_OR_HOSTNAME",
+      "server_port": 8443,
+      "uuid": "YOUR_VLESS_UUID",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "YOUR_REALITY_SNI",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "YOUR_REALITY_PUBLIC_KEY",
+          "short_id": "YOUR_REALITY_SHORT_ID"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "cloudflare",
+      "strategy": "ipv4_only"
+    },
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "ip_cidr": [
+          "YOUR_SERVER_IP/32"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "example.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "203.0.113.0/24"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      }
+    ],
+    "final": "proxy"
+  }
+}

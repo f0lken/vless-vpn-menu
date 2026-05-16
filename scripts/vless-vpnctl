@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LABEL="local.sing-box.tun"
+PLIST="/Library/LaunchDaemons/${LABEL}.plist"
+PROXY_HOST="127.0.0.1"
+PROXY_PORT="7890"
+CONFIG="${VLESS_VPN_CONFIG:-/opt/homebrew/etc/sing-box/config.json}"
+SING_BOX_BIN="/opt/homebrew/bin/sing-box"
+SING_BOX_PATTERN="/opt/homebrew/bin/sing-box run --config /opt/homebrew/etc/sing-box/config.json"
+
+BYPASS_DOMAINS=(
+  localhost 127.0.0.1 ::1 "*.local"
+  169.254/16 10/8 172.16/12 192.168/16
+)
+
+usage() {
+  cat <<EOF
+Usage: vless-vpnctl start|stop|restart|status
+       vless-vpnctl add-domain example.com
+       vless-vpnctl add-cidr 203.0.113.0/24
+       vless-vpnctl list-exclusions
+EOF
+}
+
+is_dry_run() {
+  [[ "${VLESS_VPN_DRY_RUN:-}" == "1" ]]
+}
+
+log_run() {
+  printf '%q' "$1"
+  shift
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+run() {
+  if is_dry_run; then
+    log_run "$@"
+    return 0
+  fi
+  "$@"
+}
+
+run_allow_fail() {
+  if is_dry_run; then
+    log_run "$@"
+    return 0
+  fi
+  "$@" >/dev/null 2>&1 || true
+}
+
+dry_log() {
+  if is_dry_run; then
+    printf '%s\n' "$*"
+  fi
+}
+
+require_root() {
+  if is_dry_run; then
+    return 0
+  fi
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "start/stop require administrator privileges" >&2
+    exit 77
+  fi
+}
+
+normalize_domain() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  value="${value#http://}"
+  value="${value#https://}"
+  value="${value%%/*}"
+  value="${value%%:*}"
+  value="${value%.}"
+  value="${value#\*.}"
+  printf '%s\n' "${value}"
+}
+
+validate_domain() {
+  local raw="${1:-}"
+  local value
+  value="$(normalize_domain "${raw}")"
+  if [[ ! "${value}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; then
+    echo "invalid DNS name: ${raw}" >&2
+    exit 2
+  fi
+  printf '%s\n' "${value}"
+}
+
+validate_cidr() {
+  local raw="${1:-}"
+  local normalized
+  if ! normalized="$(/usr/bin/python3 - "${raw}" <<'PY'
+import ipaddress
+import sys
+
+raw = sys.argv[1]
+try:
+    if "/" in raw:
+        network = ipaddress.ip_network(raw, strict=False)
+    else:
+        address = ipaddress.ip_address(raw)
+        network = ipaddress.ip_network(f"{address}/32" if address.version == 4 else f"{address}/128", strict=False)
+except ValueError:
+    print(f"invalid CIDR/IP: {raw}", file=sys.stderr)
+    sys.exit(2)
+
+print(network.with_prefixlen)
+PY
+  )"; then
+    exit 2
+  fi
+  printf '%s\n' "${normalized}"
+}
+
+jq_exclusions() {
+  local key="$1"
+  if [[ -f "${CONFIG}" ]]; then
+    /usr/bin/jq -r --arg key "${key}" '
+      .route.rules[]?
+      | select(.action == "route" and .outbound == "direct")
+      | .[$key][]?
+    ' "${CONFIG}" 2>/dev/null || true
+  else
+    case "${key}" in
+      domain_suffix)
+        printf '%s\n' example.com
+        ;;
+      ip_cidr)
+        printf '%s\n' 127.0.0.1/32 10.0.0.0/8 192.168.0.0/16 203.0.113.0/24
+        ;;
+    esac
+  fi
+}
+
+proxy_bypass_values() {
+  local extra_kind="${1:-}"
+  local extra_value="${2:-}"
+  local value
+  local seen_list="
+"
+  local candidate
+
+  contains_seen() {
+    local needle="$1"
+    case "${seen_list}" in
+      *"
+${needle}
+"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  emit_once() {
+    local item="$1"
+    if ! contains_seen "${item}"; then
+      printf '%s\n' "${item}"
+      seen_list="${seen_list}${item}
+"
+    fi
+  }
+
+  for value in "${BYPASS_DOMAINS[@]}"; do
+    emit_once "${value}"
+  done
+
+  while IFS= read -r value; do
+    [[ -z "${value}" ]] && continue
+    for candidate in "${value}" "*.${value}"; do
+      emit_once "${candidate}"
+    done
+  done < <(jq_exclusions domain_suffix)
+
+  while IFS= read -r value; do
+    [[ -z "${value}" ]] && continue
+    emit_once "${value}"
+  done < <(jq_exclusions ip_cidr)
+
+  if [[ -n "${extra_value}" ]]; then
+    if [[ "${extra_kind}" == "domain_suffix" ]]; then
+      for candidate in "${extra_value}" "*.${extra_value}"; do
+        emit_once "${candidate}"
+      done
+    else
+      emit_once "${extra_value}"
+    fi
+  fi
+}
+
+list_services() {
+  /usr/sbin/networksetup -listallnetworkservices 2>/dev/null \
+    | sed '1d; s/^\*//' \
+    | sed '/^[[:space:]]*$/d'
+}
+
+for_each_service() {
+  local command_name="$1"
+  local service
+  while IFS= read -r service; do
+    [[ -z "${service}" ]] && continue
+    "${command_name}" "${service}"
+  done < <(list_services)
+}
+
+configure_proxy_for_service() {
+  local service="$1"
+  local bypass_values=()
+  local value
+  while IFS= read -r value; do
+    bypass_values+=("${value}")
+  done < <(proxy_bypass_values)
+  run /usr/sbin/networksetup -setwebproxy "${service}" "${PROXY_HOST}" "${PROXY_PORT}" off
+  run /usr/sbin/networksetup -setsecurewebproxy "${service}" "${PROXY_HOST}" "${PROXY_PORT}" off
+  run /usr/sbin/networksetup -setsocksfirewallproxy "${service}" "${PROXY_HOST}" "${PROXY_PORT}" off
+  run /usr/sbin/networksetup -setproxybypassdomains "${service}" "${bypass_values[@]}"
+}
+
+configure_proxy_with_extra_for_service() {
+  local service="$1"
+  local bypass_values=()
+  local value
+  while IFS= read -r value; do
+    bypass_values+=("${value}")
+  done < <(proxy_bypass_values "${PENDING_EXCLUSION_KIND:-}" "${PENDING_EXCLUSION_VALUE:-}")
+  run /usr/sbin/networksetup -setproxybypassdomains "${service}" "${bypass_values[@]}"
+}
+
+enable_proxy_for_service() {
+  local service="$1"
+  configure_proxy_for_service "${service}"
+  run /usr/sbin/networksetup -setwebproxystate "${service}" on
+  run /usr/sbin/networksetup -setsecurewebproxystate "${service}" on
+  run /usr/sbin/networksetup -setsocksfirewallproxystate "${service}" on
+}
+
+disable_proxy_for_service() {
+  local service="$1"
+  run /usr/sbin/networksetup -setwebproxystate "${service}" off
+  run /usr/sbin/networksetup -setsecurewebproxystate "${service}" off
+  run /usr/sbin/networksetup -setsocksfirewallproxystate "${service}" off
+}
+
+start_vpn() {
+  require_root
+  for_each_service enable_proxy_for_service
+  run /bin/launchctl enable "system/${LABEL}"
+  run_allow_fail /bin/launchctl bootstrap system "${PLIST}"
+  run /bin/launchctl kickstart -k "system/${LABEL}"
+}
+
+stop_vpn() {
+  require_root
+  for_each_service disable_proxy_for_service
+  run /bin/launchctl disable "system/${LABEL}"
+  run_allow_fail /bin/launchctl bootout system "${PLIST}"
+}
+
+proxy_value() {
+  local key="$1"
+  /usr/sbin/scutil --proxy 2>/dev/null | awk -v key="${key}" '$1 == key { print $3; found = 1 } END { if (!found) print "0" }'
+}
+
+status_vpn() {
+  local service="stopped"
+  local http_proxy
+  local https_proxy
+  local socks_proxy
+  local state="off"
+
+  if pgrep -f "${SING_BOX_PATTERN}" >/dev/null 2>&1; then
+    service="running"
+  fi
+
+  http_proxy="$(proxy_value HTTPEnable)"
+  https_proxy="$(proxy_value HTTPSEnable)"
+  socks_proxy="$(proxy_value SOCKSEnable)"
+
+  if [[ "${service}" == "running" && "${http_proxy}" == "1" && "${https_proxy}" == "1" && "${socks_proxy}" == "1" ]]; then
+    state="on"
+  fi
+
+  printf 'state=%s\n' "${state}"
+  printf 'service=%s\n' "${service}"
+  printf 'http_proxy=%s\n' "${http_proxy}"
+  printf 'https_proxy=%s\n' "${https_proxy}"
+  printf 'socks_proxy=%s\n' "${socks_proxy}"
+}
+
+update_config_rule() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  local backup
+  tmp="$(mktemp)"
+  backup="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+
+  dry_log "update_config ${key} ${value}"
+  if is_dry_run; then
+    return 0
+  fi
+
+  sudo /bin/cp -a "${CONFIG}" "${backup}"
+  if ! /usr/bin/jq --arg key "${key}" --arg value "${value}" '
+    def direct_route_rule($key):
+      (.action == "route" and .outbound == "direct" and has($key));
+
+    if any(.route.rules[]?; direct_route_rule($key)) then
+      .route.rules |= map(
+        if direct_route_rule($key) then
+          .[$key] = ((.[$key] + [$value]) | unique)
+        else
+          .
+        end
+      )
+    else
+      .route.rules += [{($key): [$value], "action": "route", "outbound": "direct"}]
+    end
+  ' "${CONFIG}" > "${tmp}"; then
+    rm -f "${tmp}"
+    echo "failed to update ${CONFIG}" >&2
+    exit 1
+  fi
+
+  sudo /usr/bin/install -m 0644 -o root -g admin "${tmp}" "${CONFIG}"
+  rm -f "${tmp}"
+
+  if ! sudo "${SING_BOX_BIN}" check -c "${CONFIG}"; then
+    sudo /bin/cp -a "${backup}" "${CONFIG}"
+    echo "sing-box config check failed; restored ${backup}" >&2
+    exit 1
+  fi
+}
+
+refresh_proxy_bypass() {
+  local kind="${1:-}"
+  local value="${2:-}"
+  PENDING_EXCLUSION_KIND="${kind}"
+  PENDING_EXCLUSION_VALUE="${value}"
+  for_each_service configure_proxy_with_extra_for_service
+  unset PENDING_EXCLUSION_KIND PENDING_EXCLUSION_VALUE
+}
+
+restart_sing_box_if_running() {
+  if is_dry_run || pgrep -f "${SING_BOX_PATTERN}" >/dev/null 2>&1; then
+    run "${SING_BOX_BIN}" check -c "${CONFIG}"
+    run /bin/launchctl kickstart -k "system/${LABEL}"
+  fi
+}
+
+add_domain() {
+  require_root
+  local value
+  value="$(validate_domain "${1:-}")"
+  dry_log "validate_domain ${value}"
+  update_config_rule domain_suffix "${value}"
+  refresh_proxy_bypass domain_suffix "${value}"
+  restart_sing_box_if_running
+}
+
+add_cidr() {
+  require_root
+  local value
+  value="$(validate_cidr "${1:-}")"
+  dry_log "validate_cidr ${value}"
+  update_config_rule ip_cidr "${value}"
+  refresh_proxy_bypass ip_cidr "${value}"
+  restart_sing_box_if_running
+}
+
+list_exclusions() {
+  echo "DNS exclusions:"
+  jq_exclusions domain_suffix | sort -u | sed 's/^/  /'
+  echo "CIDR exclusions:"
+  jq_exclusions ip_cidr | sort -u | sed 's/^/  /'
+}
+
+case "${1:-}" in
+  start)
+    start_vpn
+    ;;
+  stop)
+    stop_vpn
+    ;;
+  restart)
+    stop_vpn
+    start_vpn
+    ;;
+  status)
+    status_vpn
+    ;;
+  add-domain)
+    add_domain "${2:-}"
+    ;;
+  add-cidr)
+    add_cidr "${2:-}"
+    ;;
+  list-exclusions)
+    list_exclusions
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

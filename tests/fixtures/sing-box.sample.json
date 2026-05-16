@@ -1,0 +1,20 @@
+{
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": [
+          "example.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "203.0.113.0/24"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ]
+  }
+}

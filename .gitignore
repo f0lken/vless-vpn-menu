@@ -1,0 +1,11 @@
+build/
+*.pyc
+__pycache__/
+.DS_Store
+
+# Do not publish local VPN credentials or generated app bundles.
+*.bak.*
+*.log
+*.app/
+config.json
+sing-box.json

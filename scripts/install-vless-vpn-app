@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="${ROOT}/build"
+BINARY="${BUILD_DIR}/VLESSVPN"
+APP="/Applications/VLESS VPN.app"
+APP_BINARY="${APP}/Contents/MacOS/VLESSVPN"
+INFO_PLIST="${APP}/Contents/Info.plist"
+LAUNCH_AGENT="${HOME}/Library/LaunchAgents/local.vless-vpn-menu.plist"
+
+mkdir -p "${BUILD_DIR}"
+/usr/bin/swiftc \
+  -framework AppKit \
+  -framework Foundation \
+  "${ROOT}/Sources/VLESSVPNMenu/main.swift" \
+  -o "${BINARY}"
+
+sudo /usr/bin/install -m 0755 "${ROOT}/scripts/vless-vpnctl" /usr/local/bin/vless-vpnctl
+
+sudo /bin/rm -rf "${APP}"
+sudo /bin/mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+sudo /bin/cp "${BINARY}" "${APP_BINARY}"
+sudo /bin/chmod 0755 "${APP_BINARY}"
+sudo /usr/bin/tee "${INFO_PLIST}" >/dev/null <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>ru</string>
+  <key>CFBundleExecutable</key>
+  <string>VLESSVPN</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.vless-vpn.menu</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>VLESS VPN</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Нужно для запуска системной команды включения и выключения VPN с правами администратора.</string>
+</dict>
+</plist>
+PLIST
+sudo /usr/sbin/chown -R root:wheel "${APP}"
+sudo /bin/chmod -R a+rX "${APP}"
+
+/usr/bin/defaults write local.vless-vpn.menu "NSStatusItem Preferred Position vless_vpn_status" -int 420
+
+/bin/mkdir -p "${HOME}/Library/LaunchAgents"
+/usr/bin/tee "${LAUNCH_AGENT}" >/dev/null <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.vless-vpn-menu</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>-a</string>
+    <string>${APP}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+/bin/launchctl bootout "gui/${UID}" "${LAUNCH_AGENT}" >/dev/null 2>&1 || true
+/bin/launchctl bootstrap "gui/${UID}" "${LAUNCH_AGENT}" >/dev/null 2>&1 || true
+/bin/launchctl kickstart -k "gui/${UID}/local.vless-vpn-menu" >/dev/null 2>&1 || true
+/usr/bin/open -a "${APP}"
+
+echo "Installed ${APP}"
+echo "Installed /usr/local/bin/vless-vpnctl"
+echo "Installed ${LAUNCH_AGENT}"
